@@ -29,7 +29,7 @@ MAX_COMBINATION_CENTS = 2_000_000
 
 # Quantas tentativas serão feitas para procurar
 # combinações diferentes.
-RANDOM_ATTEMPTS = 20
+RANDOM_ATTEMPTS = 40
 
 # Limite visual da descrição.
 # Evita que descrições gigantes destruam a tabela.
@@ -822,6 +822,10 @@ class App:
 
         self.combination_target = None
 
+        # Códigos usados nas últimas sugestões do Modo Avançado.
+        # Serve para favorecer variedade entre as combinações.
+        self.recent_combination_codes = []
+
         # Controle da animação de renderização. Um novo render
         # invalida qualquer animação anterior.
         self._render_generation = 0
@@ -1037,7 +1041,7 @@ class App:
 
         ttk.Label(
             brand_line,
-            text="  SITIO SÃO JOÃO • SAPIRANGA • PEDRAS • PALMEIRAS",
+            text="  CONSULTA DE PREÇO  •  USO NAS 5 LOJAS",
             style="Muted.TLabel",
             font=("Segoe UI", 9, "bold")
         ).pack(side="left", padx=10)
@@ -2397,7 +2401,12 @@ class App:
         )
 
         combination = None
+        candidates = []
 
+        # Para "Nova combinação", fazemos várias buscas com ordem
+        # aleatória dentro de cada faixa de estoque. Assim, produtos
+        # com estoque alto continuam tendo prioridade, mas a sugestão
+        # não fica presa sempre ao mesmo SKU.
         attempts = (
             RANDOM_ATTEMPTS
             if force_new
@@ -2406,41 +2415,93 @@ class App:
 
         for _ in range(attempts):
 
-            candidate = (
-                self.find_combination(
-                    target_cents
-                )
+            candidate = self.find_combination(
+                target_cents,
+                randomize=force_new
             )
 
             if not candidate:
                 continue
 
-            signature = (
-                tuple(
-                    sorted(
-                        (
-                            item["code"],
-                            item["quantity"]
-                        )
-                        for item in candidate
+            signature = tuple(
+                sorted(
+                    (
+                        item["code"],
+                        item["quantity"]
                     )
+                    for item in candidate
                 )
             )
 
-            if (
-                not force_new
-                or
-                signature != previous_signature
-            ):
-
+            if not force_new:
                 combination = candidate
-
                 break
 
-            # Se só existir uma combinação,
-            # aceita a mesma.
+            # Nunca escolhe novamente exatamente a mesma combinação.
+            if signature == previous_signature:
+                continue
 
-            combination = candidate
+            candidates.append(candidate)
+
+        if force_new and candidates:
+            # Escolhe entre as combinações encontradas, equilibrando:
+            # 1) estoque alto;
+            # 2) quantidade de SKUs diferentes;
+            # 3) variedade em relação às sugestões anteriores.
+            def candidate_score(candidate):
+                score = 0
+                codes = []
+
+                for item in candidate:
+                    code = item["code"]
+                    product = item["product"]
+                    stock = int(product.get("quantity", 0))
+                    codes.append(code)
+
+                    if stock >= 1000:
+                        tier = 1000
+                    elif stock >= 500:
+                        tier = 700
+                    elif stock >= 100:
+                        tier = 450
+                    elif stock >= 50:
+                        tier = 250
+                    else:
+                        tier = 100
+
+                    # A pontuação é por SKU, não por quantidade usada.
+                    # Isso evita premiar excessivamente um único produto
+                    # só porque ele possui milhares de unidades.
+                    score += tier
+
+                    # Pequeno bônus por diversidade de SKUs.
+                    score += 80
+
+                    # Penaliza repetir produtos que acabaram de aparecer
+                    # nas sugestões anteriores. Não é bloqueio: se forem
+                    # necessários para formar o valor, ainda podem voltar.
+                    if code in self.recent_combination_codes:
+                        score -= 350
+
+                score += len(set(codes)) * 120
+
+                # Aleatoriedade pequena para evitar empates previsíveis.
+                score += random.random() * 120
+                return score
+
+            combination = max(
+                candidates,
+                key=candidate_score
+            )
+
+        if not combination and force_new:
+            # Caso não exista uma alternativa diferente, fazemos uma
+            # última tentativa sem exigir variação. Isso preserva a
+            # funcionalidade quando só existe uma combinação exata.
+            combination = self.find_combination(
+                target_cents,
+                randomize=True
+            )
 
         if not combination:
 
@@ -2467,6 +2528,19 @@ class App:
             target_cents
         )
 
+        # Guarda os SKUs da sugestão para que a próxima "Nova combinação"
+        # tente variar. Mantemos somente as 3 últimas sugestões.
+        if force_new:
+            for item in combination:
+                code = item["code"]
+                if code in self.recent_combination_codes:
+                    self.recent_combination_codes.remove(code)
+                self.recent_combination_codes.append(code)
+
+            self.recent_combination_codes = (
+                self.recent_combination_codes[-12:]
+            )
+
         self.show_combination()
 
 
@@ -2476,7 +2550,8 @@ class App:
 
     def find_combination(
         self,
-        target_cents
+        target_cents,
+        randomize=False
     ):
 
         # ----------------------------------------------------
@@ -2527,6 +2602,49 @@ class App:
 
         if not available:
             return None
+
+        # ----------------------------------------------------
+        # PRIORIDADE + VARIAÇÃO DE ESTOQUE
+        #
+        # Faixas de estoque:
+        #   >= 1000  -> prioridade máxima
+        #   >= 500   -> prioridade alta
+        #   >= 100   -> prioridade média
+        #   >= 50    -> prioridade normal
+        #   restante -> prioridade de fallback
+        #
+        # A regra NÃO bloqueia estoques menores. Se os produtos
+        # de estoque alto não conseguirem formar o valor exato,
+        # o algoritmo desce automaticamente para a faixa seguinte.
+        # Dentro de cada faixa, a ordem pode variar a cada tentativa.
+        # ----------------------------------------------------
+
+        def stock_tier(quantity):
+            if quantity >= 1000:
+                return 5
+            if quantity >= 500:
+                return 4
+            if quantity >= 100:
+                return 3
+            if quantity >= 50:
+                return 2
+            return 1
+
+        if randomize:
+            grouped = defaultdict(list)
+            for item in available:
+                grouped[stock_tier(item[1])].append(item)
+
+            available = []
+            for tier in sorted(grouped, reverse=True):
+                group = grouped[tier]
+                random.shuffle(group)
+                available.extend(group)
+        else:
+            available.sort(
+                key=lambda item: item[1],
+                reverse=True
+            )
 
         # ----------------------------------------------------
         # Criamos blocos para transformar o problema
@@ -2580,14 +2698,44 @@ class App:
             return None
 
         # ----------------------------------------------------
-        # Randomiza a ordem.
+        # PRIORIDADE FINAL DOS BLOCOS
         #
-        # Isso permite encontrar combinações diferentes.
+        # Quando estamos procurando uma nova sugestão, preservamos
+        # a ordem aleatória dos produtos dentro de cada faixa de
+        # estoque. Assim o DP continua favorecendo estoques maiores,
+        # mas pode escolher SKUs diferentes entre uma sugestão e outra.
+        # Blocos maiores continuam vindo antes dentro do mesmo SKU.
         # ----------------------------------------------------
 
-        random.shuffle(
-            chunks
-        )
+        if not randomize:
+            chunks.sort(
+                key=lambda item: (
+                    -int(item[0].get("quantity", 0)),
+                    -item[1],
+                    item[0].get("code", "")
+                )
+            )
+        else:
+            # Em cada SKU, mantém os blocos maiores primeiro; entre SKUs,
+            # mantém a ordem aleatória definida acima.
+            ordered_chunks = []
+            grouped_chunks = defaultdict(list)
+            product_order = []
+
+            for chunk in chunks:
+                code = chunk[0]["code"]
+                if code not in grouped_chunks:
+                    product_order.append(code)
+                grouped_chunks[code].append(chunk)
+
+            for code in product_order:
+                grouped_chunks[code].sort(
+                    key=lambda item: item[1],
+                    reverse=True
+                )
+                ordered_chunks.extend(grouped_chunks[code])
+
+            chunks = ordered_chunks
 
         # ----------------------------------------------------
         # DP:
@@ -2724,7 +2872,21 @@ class App:
             in available
         }
 
-        for code, quantity in selected.items():
+        # Mostra também a sugestão final do maior estoque
+        # para o menor, deixando a prioridade transparente.
+        selected_items = sorted(
+            selected.items(),
+            key=lambda pair: (
+                -int(
+                    products_by_code[
+                        pair[0]
+                    ].get("quantity", 0)
+                ),
+                pair[0]
+            )
+        )
+
+        for code, quantity in selected_items:
 
             product = products_by_code.get(
                 code
@@ -3042,17 +3204,46 @@ class App:
         self,
         product
     ):
+        """
+        Copia o item da combinação usando a quantidade calculada.
 
-        success = self.copy_product_code(
-            product,
-            show_status=False
-        )
+        No Modo Avançado, quando a combinação precisa de mais de
+        uma unidade do mesmo produto, o código é enviado ao
+        clipboard no formato:
 
-        if not success:
+            quantidade*codigo
+
+        Exemplo:
+            4 unidades do código 00002090 -> 4*2090
+
+        Isso permite que o sistema das meninas faça a multiplicação
+        automaticamente. A baixa de estoque e os contadores também
+        acompanham a quantidade copiada.
+        """
+
+        # ----------------------------------------------------
+        # Descobre quantas unidades esse item precisa na combinação.
+        # ----------------------------------------------------
+
+        combination_quantity = 0
+
+        for item in self.current_combination:
+
+            if (
+                item["product"]["code"]
+                ==
+                product["code"]
+            ):
+                combination_quantity = int(
+                    item.get("quantity", 0)
+                )
+                break
+
+        if combination_quantity <= 0:
 
             self.combination_status.set(
-                "⚠️ Esse produto não possui "
-                "mais estoque disponível."
+                "⚠️ Esse item já foi copiado "
+                "ou não possui mais quantidade na combinação."
             )
 
             self.refresh_combination_copy_buttons()
@@ -3060,8 +3251,79 @@ class App:
             return
 
         # ----------------------------------------------------
-        # Atualiza todas as linhas da combinação que usam
-        # esse produto.
+        # Segurança: a combinação nunca pode consumir mais
+        # estoque do que o produto realmente possui.
+        # ----------------------------------------------------
+
+        available_stock = int(
+            product.get("quantity", 0)
+        )
+
+        if available_stock < combination_quantity:
+
+            self.combination_status.set(
+                "⚠️ O estoque disponível não é suficiente "
+                "para copiar toda a quantidade desta combinação."
+            )
+
+            self.refresh_combination_copy_buttons()
+
+            return
+
+        # ----------------------------------------------------
+        # Código sem zeros à esquerda.
+        #
+        # 00002090 -> 2090
+        # ----------------------------------------------------
+
+        code = self.get_copyable_code(product)
+
+        # ----------------------------------------------------
+        # Formato da cópia:
+        #
+        # 1 unidade  -> 2090
+        # 4 unidades -> 4*2090
+        # ----------------------------------------------------
+
+        copied_value = (
+            code
+            if combination_quantity == 1
+            else f"{combination_quantity}*{code}"
+        )
+
+        self.root.clipboard_clear()
+
+        self.root.clipboard_append(
+            copied_value
+        )
+
+        self.root.update()
+
+        # ----------------------------------------------------
+        # Baixa TODA a quantidade da combinação de uma vez.
+        # ----------------------------------------------------
+
+        product["quantity"] -= combination_quantity
+
+        if product["quantity"] < 0:
+
+            product["quantity"] = 0
+
+        # ----------------------------------------------------
+        # Contabiliza a quantidade real copiada.
+        #
+        # Ex.: 4*2090 = 4 cópias no total.
+        # ----------------------------------------------------
+
+        self.copy_counts[
+            product["code"]
+        ] += combination_quantity
+
+        self.total_copies += combination_quantity
+
+        # ----------------------------------------------------
+        # Zera a quantidade desse produto na combinação,
+        # pois toda a quantidade solicitada já foi copiada.
         # ----------------------------------------------------
 
         for item in self.current_combination:
@@ -3072,16 +3334,9 @@ class App:
                 product["code"]
             ):
 
-                # Uma unidade foi copiada.
-                if item["quantity"] > 0:
+                item["quantity"] = 0
 
-                    item["quantity"] -= 1
-
-                item["subtotal_cents"] = (
-                    item["price_cents"]
-                    *
-                    item["quantity"]
-                )
+                item["subtotal_cents"] = 0
 
                 quantity_label = item.get(
                     "_quantity_label"
@@ -3094,9 +3349,7 @@ class App:
                 ):
 
                     quantity_label.config(
-                        text=str(
-                            item["quantity"]
-                        )
+                        text="0"
                     )
 
                 button = item.get(
@@ -3104,8 +3357,6 @@ class App:
                 )
 
                 if (
-                    item["quantity"] <= 0
-                    and
                     button
                     and
                     button.winfo_exists()
@@ -3116,18 +3367,18 @@ class App:
                     )
 
         # ----------------------------------------------------
-        # Atualiza o status.
+        # Atualiza status.
         # ----------------------------------------------------
 
         self.status_var.set(
-            f"📋 Código {self.get_copyable_code(product)} "
-            "copiado pelo Modo Avançado. "
+            f"📋 {copied_value} copiado pelo Modo Avançado. "
             f"Estoque restante: "
             f"{format_quantity(product['quantity'])}"
         )
 
         self.combination_status.set(
-            "📋 Código copiado individualmente. "
+            "📋 Copiado: "
+            f"{copied_value}  |  "
             f"Total geral de cópias: "
             f"{self.total_copies}"
         )
